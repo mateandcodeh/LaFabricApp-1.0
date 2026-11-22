@@ -5,9 +5,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '60mb' }));
 
-// Almacén en memoria de tokens por sesión simple (para pruebas/desarrollo)
 const sessions = new Map();
 
 function slugifyRepo(val) {
@@ -29,6 +28,10 @@ function sanitizePackageId(val, repoSlug) {
   if (clean.includes('.')) return clean;
   const base = slugifyRepo(repoSlug || 'app').replace(/-/g, '') || 'app';
   return 'com.lafabricapp.' + base;
+}
+
+function escapeShell(str) {
+  return String(str || '').replace(/'/g, `'\\''`);
 }
 
 function getTokenFromReq(req) {
@@ -72,7 +75,6 @@ async function ensureRepo(owner, repoName, token, reuseExistingRepo = true) {
   if (!created.ok) {
     throw new Error(created.data.message || `No se pudo crear el repositorio ${repoName}`);
   }
-  // Pequeña pausa para que GitHub inicialice la rama por defecto
   await new Promise(r => setTimeout(r, 1500));
   return created.data;
 }
@@ -105,13 +107,119 @@ async function upsertFile(owner, repoName, filePath, contentString, token, commi
   }
 }
 
-function buildWorkflowYaml({ appName, packageId, versionName, versionCode, hasSigning }) {
-  const safeName = String(appName || 'App').replace(/"/g, '');
-  const safePkg = String(packageId || 'com.lafabricapp.app').replace(/"/g, '');
-  const safeVer = String(versionName || '1.0.0').replace(/"/g, '');
+function extractKeystoreBase64(signing) {
+  if (!signing || typeof signing !== 'object') return null;
+
+  if (typeof signing.keystoreBase64 === 'string' && signing.keystoreBase64.trim()) {
+    return signing.keystoreBase64.replace(/^data:.*;base64,/, '').trim();
+  }
+
+  if (signing.keystoreFiles && typeof signing.keystoreFiles === 'object') {
+    const entries = Object.entries(signing.keystoreFiles);
+    for (const [fname, val] of entries) {
+      const lower = String(fname || '').toLowerCase();
+      if (
+        lower.endsWith('.jks') ||
+        lower.endsWith('.keystore') ||
+        lower.endsWith('.p12') ||
+        lower.endsWith('.pfx') ||
+        lower.endsWith('.zip')
+      ) {
+        if (typeof val === 'string' && val.trim()) {
+          return val.replace(/^data:.*;base64,/, '').trim();
+        }
+        if (val && typeof val === 'object' && typeof val.base64 === 'string') {
+          return val.base64.replace(/^data:.*;base64,/, '').trim();
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function buildWorkflowYaml({ appName, packageId, versionName, versionCode, signing }) {
+  const safeName = String(appName || 'App').replace(/"/g, '').replace(/\n/g, ' ').trim() || 'App';
+  const safePkg = String(packageId || 'com.lafabricapp.app').trim();
+  const safeVer = String(versionName || '1.0.0').replace(/^v/i, '').trim() || '1.0.0';
   const vc = Math.max(1, parseInt(versionCode, 10) || 1);
 
-  return `name: Build ${safeName} (Repo Único)
+  const keystoreB64 = extractKeystoreBase64(signing);
+  const alias = String((signing && (signing.alias || signing.keyAlias)) || '').trim();
+  const storePassword = String((signing && (signing.storePassword || signing.keystorePassword || signing.password)) || '').trim();
+  const keyPassword = String((signing && (signing.keyPassword || signing.storePassword || signing.password)) || '').trim();
+  const storeType = String((signing && (signing.storeType || signing.keystoreType)) || 'JKS').toUpperCase().includes('PKCS')
+    ? 'PKCS12'
+    : 'JKS';
+
+  const hasReleaseSigning = Boolean(keystoreB64 && alias && storePassword);
+
+  const signingStep = hasReleaseSigning
+    ? `
+      - name: Preparar Keystore y firma Release
+        env:
+          KEYSTORE_B64: '${escapeShell(keystoreB64)}'
+          STORE_PASS: '${escapeShell(storePassword)}'
+          KEY_PASS: '${escapeShell(keyPassword || storePassword)}'
+          KEY_ALIAS: '${escapeShell(alias)}'
+          STORE_TYPE: '${escapeShell(storeType)}'
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore_work"
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/keystore_work/upload_blob"
+
+          if unzip -tq "$RUNNER_TEMP/keystore_work/upload_blob" >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/keystore_work/unzipped"
+            unzip -o "$RUNNER_TEMP/keystore_work/upload_blob" -d "$RUNNER_TEMP/keystore_work/unzipped"
+            KS_FILE=$(find "$RUNNER_TEMP/keystore_work/unzipped" -type f \\( -iname "*.jks" -o -iname "*.keystore" -o -iname "*.p12" -o -iname "*.pfx" \\) | head -n 1)
+          else
+            KS_FILE="$RUNNER_TEMP/keystore_work/upload_blob"
+          fi
+
+          if [ -z "$KS_FILE" ] || [ ! -f "$KS_FILE" ]; then
+            echo "No se encontró un archivo de keystore válido (.jks, .keystore, .p12, .pfx)"
+            exit 1
+          fi
+
+          cp "$KS_FILE" android/app/release-key.keystore
+
+          node -e '
+            const fs = require("fs");
+            const gradlePath = "android/app/build.gradle";
+            let gradle = fs.readFileSync(gradlePath, "utf8");
+
+            const signingBlock = \`
+    signingConfigs {
+        release {
+            storeFile file("release-key.keystore")
+            storePassword System.getenv("STORE_PASS")
+            keyAlias System.getenv("KEY_ALIAS")
+            keyPassword System.getenv("KEY_PASS")
+            storeType System.getenv("STORE_TYPE")
+        }
+    }\`;
+
+            if (gradle.includes("buildTypes {")) {
+              gradle = gradle.replace("buildTypes {", signingBlock + "\\n\\n    buildTypes {");
+            }
+
+            if (gradle.includes("release {")) {
+              gradle = gradle.replace(/release \\{[\\s\\S]*?\\n\\s*\\}/, \`release {
+            signingConfig signingConfigs.release
+            minifyEnabled false
+            shrinkResources false
+        }\`);
+            }
+
+            fs.writeFileSync(gradlePath, gradle, "utf8");
+          '
+`
+    : '';
+
+  const gradleTask = hasReleaseSigning ? 'assembleRelease' : 'assembleDebug';
+  const apkGlob = hasReleaseSigning
+    ? 'android/app/build/outputs/apk/release/*.apk'
+    : 'android/app/build/outputs/apk/debug/*.apk';
+
+  return `name: Build ${safeName} (v${safeVer} · vc${vc})
 
 on:
   workflow_dispatch:
@@ -125,32 +233,88 @@ jobs:
       - name: Checkout repositorio único
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Aplicar applicationId, versionName y versionCode
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Preparar proyecto web y Capacitor
         run: |
-          if [ -f android/app/build.gradle ]; then
-            sed -i "s/applicationId \\".*\\"/applicationId \\"${safePkg}\\"/g" android/app/build.gradle
-            sed -i "s/versionCode [0-9]*/versionCode ${vc}/g" android/app/build.gradle
-            sed -i "s/versionName \\".*\\"/versionName \\"${safeVer}\\"/g" android/app/build.gradle
+          mkdir -p www
+          if [ -f index.html ]; then
+            cp index.html www/index.html
+          elif [ ! -f www/index.html ]; then
+            echo "<h1>${safeName} v${safeVer}</h1>" > www/index.html
           fi
 
-      - name: Compilar APK
+          cat > package.json << 'EOF'
+          {
+            "name": "lafabricapp-android-wrapper",
+            "version": "${safeVer}",
+            "private": true,
+            "dependencies": {
+              "@capacitor/core": "^6.1.2",
+              "@capacitor/cli": "^6.1.2",
+              "@capacitor/android": "^6.1.2"
+            }
+          }
+          EOF
+
+          cat > capacitor.config.json << 'EOF'
+          {
+            "appId": "${safePkg}",
+            "appName": "${safeName}",
+            "webDir": "www"
+          }
+          EOF
+
+          npm install --no-audit --no-fund
+          npx cap add android
+          npx cap copy android
+
+      - name: Aplicar applicationId, versionName y versionCode
         run: |
-          if [ -f android/gradlew ]; then
-            cd android && chmod +x gradlew && ./gradlew ${hasSigning ? 'assembleRelease' : 'assembleDebug'}
-          else
-            echo "Proyecto listo en el repositorio (${safePkg} · versionCode ${vc})."
-          fi
+          node -e '
+            const fs = require("fs");
+            const p = "android/app/build.gradle";
+            let src = fs.readFileSync(p, "utf8");
+            src = src.replace(/applicationId\\s+["\\x27][^"\\x27]+["\\x27]/g, \`applicationId "${safePkg}"\`);
+            src = src.replace(/versionCode\\s+\\d+/g, \`versionCode ${vc}\`);
+            src = src.replace(/versionName\\s+["\\x27][^"\\x27]+["\\x27]/g, \`versionName "${safeVer}"\`);
+            fs.writeFileSync(p, src, "utf8");
+          '
+${signingStep}
+      - name: Compilar APK (${gradleTask})
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew ${gradleTask} --no-daemon
+
+      - name: Subir APK generado como Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${slugifyRepo(safeName)}-v${safeVer}-vc${vc}
+          path: ${apkGlob}
+          if-no-files-found: error
 `;
 }
 
 app.get('/', (_req, res) => {
-  res.json({ ok: true, service: 'FabricApp Backend', versionCodeSupport: true, singleRepoSupport: true });
+  res.json({
+    ok: true,
+    service: 'FabricApp Backend v2 (Capacitor + Signing + Artifact)',
+    versionCodeSupport: true,
+    singleRepoSupport: true
+  });
 });
 
 app.get('/api/state', async (req, res) => {
@@ -192,18 +356,18 @@ app.post('/api/build', async (req, res) => {
     const fullName = `${owner}/${repoName}`;
     const commitMsg = `Update ${versionName} (versionCode ${versionCode})${body.changelog ? ': ' + body.changelog : ''}`;
 
-    if (body.manualCode) {
-      await upsertFile(owner, repoName, 'www/index.html', body.manualCode, token, commitMsg, false);
-      await upsertFile(owner, repoName, 'index.html', body.manualCode, token, commitMsg, false);
+    const htmlCode = body.manualCode || body.htmlCode || body.html || '';
+    if (htmlCode) {
+      await upsertFile(owner, repoName, 'index.html', htmlCode, token, commitMsg, false);
+      await upsertFile(owner, repoName, 'www/index.html', htmlCode, token, commitMsg, false);
     }
 
-    const hasSigning = Boolean(body.signing && body.signing.keystoreFiles && Object.keys(body.signing.keystoreFiles).length > 0);
     const yml = buildWorkflowYaml({
       appName: body.appName || repoName,
       packageId,
       versionName,
       versionCode,
-      hasSigning
+      signing: body.signing || null
     });
     await upsertFile(owner, repoName, '.github/workflows/build.yml', yml, token, commitMsg, false);
 
@@ -212,6 +376,7 @@ app.post('/api/build', async (req, res) => {
       reusedRepo: reuseExistingRepo,
       repo: fullName,
       repoUrl: repoData.html_url,
+      actionsUrl: `${repoData.html_url}/actions`,
       packageId,
       versionName,
       versionCode
@@ -243,6 +408,6 @@ app.get('/api/runs', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`FabricApp backend listening on port ${PORT}`);
+  console.log(`FabricApp backend v2 listening on port ${PORT}`);
 });
-    
+          
