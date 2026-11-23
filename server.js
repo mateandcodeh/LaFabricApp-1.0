@@ -1,577 +1,553 @@
+'use strict';
+
 const express = require('express');
-const cors = require('cors');
+const crypto = require('crypto');
+const path = require('path');
 
 const app = express();
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// CORS para permitir acceso desde WebView / Capacitor / navegador
+app.use((req, res, next) => {
+  const origin = req.headers.origin || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// Servir frontend estático si existe carpeta public/
+app.use(express.static(path.join(__dirname, 'public')));
+
 const PORT = process.env.PORT || 3000;
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || 'https://lafabricapp-1-0.onrender.com').replace(/\/+$/, '');
 
-app.use(cors());
-app.use(express.json({ limit: '60mb' }));
-
+// Almacén en memoria de sesiones y códigos de vinculación móvil
 const sessions = new Map();
+const linkCodes = new Map();
 
-function slugifyRepo(val) {
-  return String(val || 'mi-app-lafabricapp')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-{2,}/g, '-') || 'mi-app-lafabricapp';
+function crearSessionToken(ghToken, login) {
+  const apiToken = 'lf_' + crypto.randomBytes(24).toString('hex');
+  sessions.set(apiToken, { ghToken, login, createdAt: Date.now() });
+  return apiToken;
 }
 
-function sanitizePackageId(val, repoSlug) {
-  const clean = String(val || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9._]/g, '')
-    .replace(/\.{2,}/g, '.')
-    .replace(/^\.+|\.+$/g, '');
-  if (clean.includes('.')) return clean;
-  const base = slugifyRepo(repoSlug || 'app').replace(/-/g, '') || 'app';
-  return 'com.lafabricapp.' + base;
-}
-
-function escapeShell(str) {
-  return String(str || '').replace(/'/g, `'\\''`);
-}
-
-function getTokenFromReq(req) {
+function resolverAuth(req) {
   const auth = req.headers.authorization || '';
-  if (auth.startsWith('Bearer ')) {
-    const t = auth.slice(7).trim();
-    return sessions.get(t) || t;
+  const raw = auth.startsWith('Bearer ') ? auth.slice(7).trim() : (req.query.token || '').trim();
+  if (!raw) return null;
+  if (sessions.has(raw)) return sessions.get(raw);
+  // También permite pasar un PAT de GitHub directamente si el servidor reinició en Render
+  if (/^(ghp_|github_pat_|gho_)/.test(raw)) {
+    return { ghToken: raw, login: null };
   }
-  return process.env.GITHUB_TOKEN || '';
+  return null;
 }
 
-async function ghFetch(url, token, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, status: res.status, data };
+async function ghFetch(ghToken, endpoint, opts = {}) {
+  const url = endpoint.startsWith('http') ? endpoint : `https://api.github.com${endpoint}`;
+  const headers = Object.assign({
+    'Authorization': `Bearer ${ghToken}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'LaFabricApp-Server'
+  }, opts.headers || {});
+  return fetch(url, Object.assign({}, opts, { headers }));
 }
 
-async function ensureRepo(owner, repoName, token, reuseExistingRepo = true) {
-  if (reuseExistingRepo) {
-    const existing = await ghFetch(`https://api.github.com/repos/${owner}/${repoName}`, token);
-    if (existing.ok) return existing.data;
+async function obtenerUsuarioGitHub(ghToken) {
+  const r = await ghFetch(ghToken, '/user');
+  if (!r.ok) throw new Error('Token de GitHub inválido o sin permisos.');
+  return r.json();
+}
+
+// ---- Seguridad en HTML (respaldo del lado del servidor) ----
+function inyectarEscudoSeguridadServidor(html) {
+  if (!html || html.includes('id="lf-privacy-shield"')) return html;
+  const bloque = [
+    '<meta http-equiv="X-Content-Type-Options" content="nosniff">',
+    '<meta name="referrer" content="no-referrer">',
+    '<script id="lf-privacy-shield">(function(){window.lfSafeText=function(el,v){if(!el)return;el.textContent=v==null?"":String(v);};try{window.eval=function(){throw new Error("eval bloqueado");};window.Function=function(){throw new Error("Function bloqueado");};}catch(e){}document.addEventListener("click",function(ev){var a=ev.target&&ev.target.closest?ev.target.closest("a[href]"):null;if(!a)return;var h=a.getAttribute("href")||"";if(/^https?:\/\//i.test(h)){var rel=new Set((a.getAttribute("rel")||"").toLowerCase().split(/\s+/).filter(Boolean));rel.add("noopener");rel.add("noreferrer");a.setAttribute("rel",Array.from(rel).join(" "));}},true);})();<\/script>'
+  ].join('\n');
+  const idx = html.lastIndexOf('</body>');
+  if (idx === -1) return html + '\n' + bloque;
+  return html.slice(0, idx) + bloque + '\n' + html.slice(idx);
+}
+
+// ---- GitHub Repo & Archivos ----
+async function asegurarRepositorio({ ghToken, owner, repoName, privateRepo = false, description = 'Generado con LaFabricApp' }) {
+  const check = await ghFetch(ghToken, `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}`);
+  if (check.ok) {
+    return check.json();
   }
-  const created = await ghFetch('https://api.github.com/user/repos', token, {
+  const create = await ghFetch(ghToken, '/user/repos', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       name: repoName,
-      private: false,
-      auto_init: true,
-      description: `Repositorio unico gestionado por LaFabricApp (${repoName})`
+      description,
+      private: Boolean(privateRepo),
+      auto_init: false
     })
   });
-  if (!created.ok) {
-    throw new Error(created.data.message || `No se pudo crear el repositorio ${repoName}`);
+  if (!create.ok) {
+    const err = await create.json().catch(() => ({}));
+    throw new Error(err.message || `No se pudo crear el repositorio (${create.status})`);
   }
-  await new Promise(r => setTimeout(r, 1500));
-  return created.data;
+  return create.json();
 }
 
-async function upsertFile(owner, repoName, filePath, contentString, token, commitMessage, isBase64 = false) {
-  const encodedContent = isBase64
-    ? contentString
-    : Buffer.from(contentString, 'utf8').toString('base64');
+async function subirArchivoGitHub({ ghToken, owner, repo, filePath, contentBase64, message, branch = 'main' }) {
+  const cleanPath = filePath.replace(/^\/+/, '');
+  const apiPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${cleanPath.split('/').map(encodeURIComponent).join('/')}`;
 
-  const getRes = await ghFetch(
-    `https://api.github.com/repos/${owner}/${repoName}/contents/${encodeURIComponent(filePath)}`,
-    token
-  );
-  const sha = getRes.ok && getRes.data && getRes.data.sha ? getRes.data.sha : undefined;
+  let sha;
+  const existing = await ghFetch(ghToken, `${apiPath}?ref=${encodeURIComponent(branch)}`);
+  if (existing.ok) {
+    const data = await existing.json();
+    sha = data.sha;
+  }
 
-  const putRes = await ghFetch(
-    `https://api.github.com/repos/${owner}/${repoName}/contents/${encodeURIComponent(filePath)}`,
-    token,
-    {
-      method: 'PUT',
-      body: JSON.stringify({
-        message: commitMessage,
-        content: encodedContent,
-        ...(sha ? { sha } : {})
-      })
-    }
-  );
+  const body = {
+    message: message || `Update ${cleanPath}`,
+    content: contentBase64,
+    branch
+  };
+  if (sha) body.sha = sha;
+
+  const putRes = await ghFetch(ghToken, apiPath, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
   if (!putRes.ok) {
-    throw new Error(putRes.data.message || `Error subiendo ${filePath}`);
+    const err = await putRes.json().catch(() => ({}));
+    throw new Error(`Error subiendo ${cleanPath}: ${err.message || putRes.status}`);
   }
+  return putRes.json();
 }
 
-function cleanBase64(val) {
-  if (!val || typeof val !== 'string') return null;
-  const trimmed = val.replace(/^data:[^;]+;base64,/, '').trim();
-  return trimmed.length > 20 ? trimmed : null;
-}
-
-function extractKeystoreBase64(signing) {
-  if (!signing || typeof signing !== 'object') return null;
-
-  const direct = cleanBase64(signing.keystoreBase64);
-  if (direct) return direct;
-
-  if (signing.keystoreFiles && typeof signing.keystoreFiles === 'object') {
-    const entries = Object.entries(signing.keystoreFiles);
-    for (const [fname, val] of entries) {
-      const lower = String(fname || '').toLowerCase();
-      if (
-        lower.endsWith('.jks') ||
-        lower.endsWith('.keystore') ||
-        lower.endsWith('.p12') ||
-        lower.endsWith('.pfx') ||
-        lower.endsWith('.zip')
-      ) {
-        if (typeof val === 'string') {
-          const b = cleanBase64(val);
-          if (b) return b;
-        }
-        if (val && typeof val === 'object' && typeof val.base64 === 'string') {
-          const b = cleanBase64(val.base64);
-          if (b) return b;
-        }
-      }
-    }
+function dataUrlToBase64(dataUrlOrText, isBinary = false) {
+  if (!dataUrlOrText) return '';
+  if (typeof dataUrlOrText === 'string' && dataUrlOrText.startsWith('data:')) {
+    const idx = dataUrlOrText.indexOf(',');
+    return idx !== -1 ? dataUrlOrText.slice(idx + 1) : '';
   }
-  return null;
+  if (isBinary) return Buffer.from(dataUrlOrText, 'base64').toString('base64');
+  return Buffer.from(String(dataUrlOrText), 'utf8').toString('base64');
 }
 
-function extractLogoBase64(body) {
-  if (!body || typeof body !== 'object') return null;
+// ---- Activación automática de GitHub Pages en rama `main` ----
+async function asegurarGitHubPagesMain({ owner, repo, ghToken, branch = 'main', sitePath = '/' }) {
+  const baseUrl = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pages`;
 
-  const candidates = [
-    body.logo,
-    body.logoBase64,
-    body.iconBase64,
-    body.logoDataUrl,
-    body.iconDataUrl,
-    body.icon,
-    body.assets && body.assets.logoBase64,
-    body.assets && body.assets.logo,
-    body.assets && body.assets.icon
-  ];
+  // 1) Crear/habilitar Pages apuntando a `main` / `/`
+  const createRes = await ghFetch(ghToken, baseUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source: { branch, path: sitePath }
+    })
+  });
 
-  for (const item of candidates) {
-    if (typeof item === 'string') {
-      const b = cleanBase64(item);
-      if (b) return b;
-    } else if (item && typeof item === 'object') {
-      const b = cleanBase64(item.base64 || item.dataUrl || item.content);
-      if (b) return b;
-    }
+  if (createRes.ok) {
+    const data = await createRes.json().catch(() => ({}));
+    return {
+      ok: true,
+      action: 'created',
+      url: data.html_url || `https://${owner}.github.io/${repo}/`
+    };
   }
-  return null;
+
+  // 2) Si ya existía pero quedó en `None` o en otra rama, forzar `PUT` hacia `main`
+  const updateRes = await ghFetch(ghToken, baseUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source: { branch, path: sitePath }
+    })
+  });
+
+  if (updateRes.ok) {
+    const data = await updateRes.json().catch(() => ({}));
+    return {
+      ok: true,
+      action: 'updated',
+      url: data.html_url || `https://${owner}.github.io/${repo}/`
+    };
+  }
+
+  const errData = await updateRes.json().catch(() => ({}));
+  return {
+    ok: false,
+    status: updateRes.status,
+    error: errData.message || 'No se pudo configurar GitHub Pages en main'
+  };
 }
 
-function buildApplyLogoScript() {
-  return [
-    "const fs = require('fs');",
-    "const path = require('path');",
-    "",
-    "const srcCandidates = [",
-    "  path.join(process.cwd(), 'assets', 'logo.png'),",
-    "  path.join(process.cwd(), 'www', 'logo.png')",
-    "];",
-    "const srcLogo = srcCandidates.find(p => fs.existsSync(p));",
-    "if (!srcLogo) {",
-    "  console.log('Sin logo para aplicar a mipmap.');",
-    "  process.exit(0);",
-    "}",
-    "",
-    "const resDir = path.join(process.cwd(), 'android', 'app', 'src', 'main', 'res');",
-    "if (!fs.existsSync(resDir)) {",
-    "  console.log('No existe carpeta res de Android todavia.');",
-    "  process.exit(0);",
-    "}",
-    "",
-    "const anydpiDir = path.join(resDir, 'mipmap-anydpi-v26');",
-    "if (fs.existsSync(anydpiDir)) {",
-    "  fs.rmSync(anydpiDir, { recursive: true, force: true });",
-    "}",
-    "",
-    "const entries = fs.readdirSync(resDir, { withFileTypes: true });",
-    "for (const entry of entries) {",
-    "  if (entry.isDirectory() && entry.name.startsWith('mipmap-')) {",
-    "    const dirPath = path.join(resDir, entry.name);",
-    "    for (const fn of fs.readdirSync(dirPath)) {",
-    "      if (fn.endsWith('.xml') || fn.endsWith('.webp')) {",
-    "        fs.rmSync(path.join(dirPath, fn), { force: true });",
-    "      }",
-    "    }",
-    "    for (const targetName of ['ic_launcher.png', 'ic_launcher_round.png', 'ic_launcher_foreground.png']) {",
-    "      fs.copyFileSync(srcLogo, path.join(dirPath, targetName));",
-    "    }",
-    "  }",
-    "}",
-    "",
-    "console.log('Logo aplicado a carpetas mipmap desde:', srcLogo);",
-    ""
-  ].join('\n');
-}
+// ---- Workflow de GitHub Actions para APK Capacitor (con firma opcional) ----
+function generarWorkflowApk({ appName, packageId, versionName, versionCode, signing }) {
+  const firmaActiva = Boolean(signing && signing.enabled && signing.alias && signing.storePassword);
 
-function buildConfigureScript({ packageId, versionName, versionCode, hasReleaseSigning }) {
-  const pkgEsc = JSON.stringify(packageId);
-  const verEsc = JSON.stringify(versionName);
-  const vcNum = Math.max(1, parseInt(versionCode, 10) || 1);
-  const signBool = hasReleaseSigning ? 'true' : 'false';
-
-  return [
-    "const fs = require('fs');",
-    "const path = require('path');",
-    "",
-    "const gradlePath = path.join(process.cwd(), 'android', 'app', 'build.gradle');",
-    "let gradle = fs.readFileSync(gradlePath, 'utf8');",
-    "",
-    `const targetPkg = ${pkgEsc};`,
-    `const targetVer = ${verEsc};`,
-    `const targetVc = ${vcNum};`,
-    `const useSigning = ${signBool};`,
-    "",
-    "gradle = gradle.split('\\n').map(line => {",
-    "  if (line.indexOf('applicationId') !== -1 && (line.indexOf('\"') !== -1 || line.indexOf(\"'\") !== -1)) {",
-    "    return '        applicationId \"' + targetPkg + '\"';",
-    "  }",
-    "  if (line.indexOf('versionCode') !== -1) {",
-    "    return '        versionCode ' + targetVc;",
-    "  }",
-    "  if (line.indexOf('versionName') !== -1 && (line.indexOf('\"') !== -1 || line.indexOf(\"'\") !== -1)) {",
-    "    return '        versionName \"' + targetVer + '\"';",
-    "  }",
-    "  return line;",
-    "}).join('\\n');",
-    "",
-    "if (useSigning) {",
-    "  const signingBlock = [",
-    "    '    signingConfigs {',",
-    "    '        release {',",
-    "    '            def ksFile = file(\"release-key.keystore\")',",
-    "    '            if (ksFile.exists()) {',",
-    "    '                storeFile ksFile',",
-    "    '            }',",
-    "    '            def sPass = System.getenv(\"STORE_PASS\")',",
-    "    '            def kPass = System.getenv(\"KEY_PASS\")',",
-    "    '            def kAlias = System.getenv(\"KEY_ALIAS\")',",
-    "    '            def sType = System.getenv(\"STORE_TYPE\")',",
-    "    '            if (sPass) storePassword sPass',",
-    "    '            if (kPass) keyPassword kPass',",
-    "    '            if (kAlias) keyAlias kAlias',",
-    "    '            if (sType) storeType sType',",
-    "    '        }',",
-    "    '    }',",
-    "    ''",
-    "  ].join('\\n');",
-    "",
-    "  if (gradle.indexOf('signingConfigs {') === -1 && gradle.indexOf('buildTypes {') !== -1) {",
-    "    gradle = gradle.replace('buildTypes {', signingBlock + '    buildTypes {');",
-    "  }",
-    "",
-    "  const btIdx = gradle.indexOf('buildTypes {');",
-    "  if (btIdx !== -1) {",
-    "    const relIdx = gradle.indexOf('release {', btIdx);",
-    "    if (relIdx !== -1) {",
-    "      const openBrace = gradle.indexOf('{', relIdx);",
-    "      let depth = 0;",
-    "      let endBrace = -1;",
-    "      for (let i = openBrace; i < gradle.length; i++) {",
-    "        if (gradle[i] === '{') depth++;",
-    "        else if (gradle[i] === '}') {",
-    "          depth--;",
-    "          if (depth === 0) {",
-    "            endBrace = i;",
-    "            break;",
-    "          }",
-    "        }",
-    "      }",
-    "      if (endBrace !== -1) {",
-    "        const newRelease = [",
-    "          'release {',",
-    "          '            signingConfig signingConfigs.release',",
-    "          '            minifyEnabled false',",
-    "          '            shrinkResources false',",
-    "          '        }'",
-    "        ].join('\\n');",
-    "        gradle = gradle.slice(0, relIdx) + newRelease + gradle.slice(endBrace + 1);",
-    "      }",
-    "    }",
-    "  }",
-    "}",
-    "",
-    "fs.writeFileSync(gradlePath, gradle, 'utf8');",
-    "console.log('Configurado build.gradle -> ' + targetPkg + ' vc=' + targetVc + ' v=' + targetVer);",
-    ""
-  ].join('\n');
-}
-
-function buildWorkflowYaml({ appName, packageId, versionName, versionCode, signing }) {
-  const safeName = String(appName || 'App').replace(/[^a-zA-Z0-9 _.-]/g, '').trim() || 'App';
-  const safePkg = String(packageId || 'com.lafabricapp.app').trim();
-  const safeVer = String(versionName || '1.0.0').replace(/^v/i, '').trim() || '1.0.0';
-  const vc = Math.max(1, parseInt(versionCode, 10) || 1);
-
-  const keystoreB64 = extractKeystoreBase64(signing);
-  const alias = String((signing && (signing.alias || signing.keyAlias)) || '').trim();
-  const storePassword = String((signing && (signing.storePassword || signing.keystorePassword || signing.password)) || '').trim();
-  const keyPassword = String((signing && (signing.keyPassword || signing.storePassword || signing.password)) || '').trim();
-  const storeType = String((signing && (signing.storeType || signing.keystoreType)) || 'JKS').toUpperCase().includes('PKCS')
-    ? 'PKCS12'
-    : 'JKS';
-
-  const hasReleaseSigning = Boolean(keystoreB64 && alias && storePassword);
-
-  const signingStep = hasReleaseSigning
-    ? `
-      - name: Preparar Keystore
+  const pasosFirma = firmaActiva ? `
+      - name: Decodificar Keystore
         env:
-          KEYSTORE_B64: '${escapeShell(keystoreB64)}'
+          KEYSTORE_B64: \${{ secrets.LF_KEYSTORE_B64 }}
         run: |
-          mkdir -p "$RUNNER_TEMP/ks"
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/ks/blob"
-          if unzip -tq "$RUNNER_TEMP/ks/blob" >/dev/null 2>&1; then
-            mkdir -p "$RUNNER_TEMP/ks/out"
-            unzip -o "$RUNNER_TEMP/ks/blob" -d "$RUNNER_TEMP/ks/out"
-            KS_FILE=$(find "$RUNNER_TEMP/ks/out" -type f \\( -iname "*.jks" -o -iname "*.keystore" -o -iname "*.p12" -o -iname "*.pfx" \\) | head -n 1)
-          else
-            KS_FILE="$RUNNER_TEMP/ks/blob"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           fi
-          if [ -z "$KS_FILE" ] || [ ! -f "$KS_FILE" ]; then
-            echo "No se encontro un keystore valido"
-            exit 1
-          fi
-          cp "$KS_FILE" android/app/release-key.keystore
-`
-    : '';
 
-  const gradleTask = hasReleaseSigning ? 'assembleRelease' : 'assembleDebug';
-  const apkGlob = hasReleaseSigning
+      - name: Compilar APK Release firmado
+        env:
+          STORE_PASS: \${{ secrets.LF_STORE_PASS }}
+          KEY_PASS: \${{ secrets.LF_KEY_PASS }}
+          KEY_ALIAS: \${{ secrets.LF_KEY_ALIAS }}
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease \\
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \\
+            -Pandroid.injected.signing.store.password="$STORE_PASS" \\
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \\
+            -Pandroid.injected.signing.key.password="\${KEY_PASS:-$STORE_PASS}"
+` : `
+      - name: Compilar APK Debug (sin firma release)
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+`;
+
+  const rutaApk = firmaActiva
     ? 'android/app/build/outputs/apk/release/*.apk'
     : 'android/app/build/outputs/apk/debug/*.apk';
 
-  const envBlock = hasReleaseSigning
-    ? `
-        env:
-          STORE_PASS: '${escapeShell(storePassword)}'
-          KEY_PASS: '${escapeShell(keyPassword || storePassword)}'
-          KEY_ALIAS: '${escapeShell(alias)}'
-          STORE_TYPE: '${escapeShell(storeType)}'`
-    : '';
-
-  return `name: Build ${safeName}
+  return `name: Build Android APK
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
-  build-android:
+  build-apk:
     runs-on: ubuntu-latest
-    env:
-      ANDROID_HOME: /usr/local/lib/android/sdk
-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
     steps:
-      - name: Checkout repositorio
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
-          java-version: "17"
+          distribution: 'temurin'
+          java-version: '17'
 
-      - name: Preparar entorno Android SDK
+      - name: Instalar Capacitor y generar proyecto Android
         run: |
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/16.0/bin:$ANDROID_HOME/platform-tools:$PATH"
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-      - name: Preparar proyecto Capacitor
-        run: |
-          mkdir -p www
-          if [ -f index.html ]; then
-            cp index.html www/index.html
-          fi
-          if [ -f assets/logo.png ]; then
-            cp assets/logo.png www/logo.png
-          fi
-          cat > package.json << 'EOF'
-          {
-            "name": "lafabricapp-android-wrapper",
-            "version": "${safeVer}",
-            "private": true,
-            "dependencies": {
-              "@capacitor/core": "^6.1.2",
-              "@capacitor/cli": "^6.1.2",
-              "@capacitor/android": "^6.1.2"
-            }
-          }
-          EOF
-          cat > capacitor.config.json << 'EOF'
-          {
-            "appId": "${safePkg}",
-            "appName": "${safeName}",
-            "webDir": "www"
-          }
-          EOF
-          npm install --no-audit --no-fund
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npx cap init "${appName.replace(/"/g, '')}" "${packageId}" --web-dir=www
           npx cap add android
-          npx cap copy android
-          node scripts/apply-logo.js
-${signingStep}
-      - name: Configurar Gradle y firma${envBlock}
-        run: node scripts/configure-android.js
-
-      - name: Compilar APK${envBlock}
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew ${gradleTask} --no-daemon
-
-      - name: Subir APK Artifact
+          node -e '
+            const fs = require("fs");
+            const p = "android/app/build.gradle";
+            if (fs.existsSync(p)) {
+              let g = fs.readFileSync(p, "utf8");
+              g = g.replace(/versionCode\\s+\\d+/, "versionCode ${Number(versionCode) || 1}");
+              g = g.replace(/versionName\\s+"[^"]*"/, "versionName \\"${String(versionName || '1.0.0').replace(/"/g, '')}\\"");
+              fs.writeFileSync(p, g);
+            }
+          '
+          npx cap sync android
+${pasosFirma}
+      - name: Subir artefacto APK
         uses: actions/upload-artifact@v4
         with:
-          name: ${slugifyRepo(safeName)}-v${safeVer}-vc${vc}
-          path: ${apkGlob}
+          name: app-android-apk
+          path: ${rutaApk}
           if-no-files-found: error
 `;
 }
 
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'FabricApp Backend',
-    versionCodeSupport: true,
-    singleRepoSupport: true
-  });
-});
-
+// ---- Endpoints API ----
 app.get('/api/state', async (req, res) => {
-  const token = getTokenFromReq(req);
-  if (!token) return res.json({ github: false });
-  const u = await ghFetch('https://api.github.com/user', token);
-  if (!u.ok) return res.json({ github: false });
-  return res.json({ github: true, login: u.data.login });
-});
-
-app.post('/api/token', async (req, res) => {
-  const token = String((req.body && req.body.token) || '').trim();
-  if (!token) return res.status(400).json({ error: 'Falta el token de GitHub' });
-  const u = await ghFetch('https://api.github.com/user', token);
-  if (!u.ok) return res.status(401).json({ error: 'Token de GitHub invalido' });
-  const sessionToken = 'lf_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-  sessions.set(sessionToken, token);
-  return res.json({ ok: true, login: u.data.login, token: sessionToken });
-});
-
-app.post('/api/build', async (req, res) => {
+  const auth = resolverAuth(req);
+  if (!auth) return res.json({ ok: true, github: false });
   try {
-    const token = getTokenFromReq(req);
-    if (!token) return res.status(401).json({ error: 'Conecta GitHub con token primero' });
-
-    const u = await ghFetch('https://api.github.com/user', token);
-    if (!u.ok) return res.status(401).json({ error: 'No se pudo verificar el usuario en GitHub' });
-    const owner = u.data.login;
-
-    const body = req.body || {};
-    const repoSlug = slugifyRepo(body.repoSlug || body.repoName || body.appName);
-    const packageId = sanitizePackageId(body.packageId || body.applicationId, repoSlug);
-    const versionName = String(body.versionName || body.version || '1.0.0').replace(/^v/i, '').trim() || '1.0.0';
-    const versionCode = Math.max(1, parseInt(body.versionCode, 10) || 1);
-    const reuseExistingRepo = body.reuseExistingRepo !== false && body.createNewRepoPerBuild !== true;
-
-    const repoData = await ensureRepo(owner, repoSlug, token, reuseExistingRepo);
-    const repoName = repoData.name;
-    const fullName = `${owner}/${repoName}`;
-    const commitMsg = `Update ${versionName} (versionCode ${versionCode})${body.changelog ? ': ' + body.changelog : ''}`;
-
-    const htmlCode = body.manualCode || body.htmlCode || body.html || '';
-    if (htmlCode) {
-      await upsertFile(owner, repoName, 'index.html', htmlCode, token, commitMsg, false);
-      await upsertFile(owner, repoName, 'www/index.html', htmlCode, token, commitMsg, false);
-    }
-
-    const logoB64 = extractLogoBase64(body);
-    if (logoB64) {
-      await upsertFile(owner, repoName, 'assets/logo.png', logoB64, token, commitMsg, true);
-      await upsertFile(owner, repoName, 'www/logo.png', logoB64, token, commitMsg, true);
-    }
-
-    const applyLogoScript = buildApplyLogoScript();
-    await upsertFile(owner, repoName, 'scripts/apply-logo.js', applyLogoScript, token, commitMsg, false);
-
-    const signingObj = body.signing || null;
-    const keystoreB64 = extractKeystoreBase64(signingObj);
-    const alias = String((signingObj && (signingObj.alias || signingObj.keyAlias)) || '').trim();
-    const storePassword = String((signingObj && (signingObj.storePassword || signingObj.keystorePassword || signingObj.password)) || '').trim();
-    const hasReleaseSigning = Boolean(keystoreB64 && alias && storePassword);
-
-    const configureScript = buildConfigureScript({
-      packageId,
-      versionName,
-      versionCode,
-      hasReleaseSigning
-    });
-    await upsertFile(owner, repoName, 'scripts/configure-android.js', configureScript, token, commitMsg, false);
-
-    const yml = buildWorkflowYaml({
-      appName: body.appName || repoName,
-      packageId,
-      versionName,
-      versionCode,
-      signing: signingObj
-    });
-    await upsertFile(owner, repoName, '.github/workflows/build.yml', yml, token, commitMsg, false);
-
-    return res.json({
-      ok: true,
-      reusedRepo: reuseExistingRepo,
-      repo: fullName,
-      repoUrl: repoData.html_url,
-      actionsUrl: `${repoData.html_url}/actions`,
-      packageId,
-      versionName,
-      versionCode,
-      logoIncluded: Boolean(logoB64)
-    });
-  } catch (err) {
-    return res.status(500).json({ error: err.message || 'Error interno en /api/build' });
+    const user = auth.login ? { login: auth.login } : await obtenerUsuarioGitHub(auth.ghToken);
+    auth.login = user.login;
+    res.json({ ok: true, github: true, login: user.login });
+  } catch (e) {
+    res.json({ ok: true, github: false });
   }
 });
 
-app.get('/api/runs', async (req, res) => {
+app.post('/api/token', async (req, res) => {
   try {
-    const token = getTokenFromReq(req);
-    const repo = String((req.query && req.query.repo) || '').trim();
-    if (!token || !repo) return res.json({ none: true });
-    const runsRes = await ghFetch(`https://api.github.com/repos/${repo}/actions/runs?per_page=1`, token);
-    if (!runsRes.ok || !runsRes.data.workflow_runs || !runsRes.data.workflow_runs.length) {
-      return res.json({ none: true });
-    }
-    const lastRun = runsRes.data.workflow_runs[0];
-    return res.json({
-      none: false,
-      status: lastRun.status,
-      conclusion: lastRun.conclusion,
-      html_url: lastRun.html_url
+    const token = String(req.body?.token || '').trim();
+    if (!token) return res.status(400).json({ error: 'Falta el token de GitHub.' });
+    const user = await obtenerUsuarioGitHub(token);
+    const apiToken = crearSessionToken(token, user.login);
+    res.json({ ok: true, login: user.login, token: apiToken });
+  } catch (e) {
+    res.status(401).json({ error: e.message || 'Token inválido.' });
+  }
+});
+
+// OAuth estándar y flujo móvil por código
+app.get('/api/link/start', (req, res) => {
+  const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+  linkCodes.set(code, { ok: false, createdAt: Date.now() });
+  res.json({ ok: true, code });
+});
+
+app.get('/api/link/status', (req, res) => {
+  const code = String(req.query.code || '').trim().toUpperCase();
+  const entry = linkCodes.get(code);
+  if (!entry) return res.json({ ok: false });
+  res.json(entry);
+});
+
+app.get('/auth/github', (req, res) => {
+  if (!GITHUB_CLIENT_ID) {
+    return res.status(500).send('Falta configurar GITHUB_CLIENT_ID en Render.');
+  }
+  const state = String(req.query.state || '');
+  const redirectUri = `${PUBLIC_BASE_URL}/auth/github/callback`;
+  const url = `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(redirectUri)}&scope=${encodeURIComponent('repo workflow')}&state=${encodeURIComponent(state)}`;
+  res.redirect(url);
+});
+
+app.get('/auth/github/callback', async (req, res) => {
+  try {
+    const code = String(req.query.code || '');
+    const state = String(req.query.state || '');
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code
+      })
     });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error('No se recibió access_token de GitHub.');
+    const user = await obtenerUsuarioGitHub(tokenData.access_token);
+    const apiToken = crearSessionToken(tokenData.access_token, user.login);
+
+    if (state.startsWith('link-')) {
+      const linkCode = state.slice(5).toUpperCase();
+      linkCodes.set(linkCode, { ok: true, login: user.login, token: apiToken });
+      return res.send('<h2>¡Conectado a GitHub!</h2><p>Ya podés volver a LaFabricApp.</p>');
+    }
+    res.redirect(`/?token=${encodeURIComponent(apiToken)}`);
+  } catch (e) {
+    res.redirect(`/?error=${encodeURIComponent(e.message || 'Error OAuth')}`);
+  }
+});
+
+// ---- Ruta principal de construcción ----
+app.post('/api/build', async (req, res) => {
+  const auth = resolverAuth(req);
+  if (!auth) return res.status(401).json({ error: 'No conectado a GitHub.' });
+
+  try {
+    const user = auth.login ? { login: auth.login } : await obtenerUsuarioGitHub(auth.ghToken);
+    auth.login = user.login;
+    const owner = user.login;
+
+    const body = req.body || {};
+    const type = body.type || 'web'; // 'web' | 'pwa' | 'apk'
+    const kind = body.kind || 'web';
+    const appName = String(body.appName || 'Mi App').trim();
+    const repoName = String(body.repoSlug || body.repoName || 'mi-app')
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'mi-app';
+    const packageId = String(body.packageId || body.applicationId || `com.lafabricapp.${repoName.replace(/-/g, '')}`);
+    const versionName = String(body.versionName || '1.0.0');
+    const versionCode = Number(body.versionCode) || 1;
+    const changelog = String(body.changelog || `Build ${versionName}`);
+    const privateRepo = Boolean(body.privateRepo);
+    const signing = (body.signing && body.signing.enabled) ? body.signing : null;
+
+    // 1. Crear o recuperar repositorio (público por defecto para GitHub Pages gratuito)
+    const repoInfo = await asegurarRepositorio({
+      ghToken: auth.ghToken,
+      owner,
+      repoName,
+      privateRepo,
+      description: `${appName} (${versionName})`
+    });
+
+    const defaultBranch = repoInfo.default_branch || 'main';
+
+    // 2. Preparar HTML (aplicando escudo si viene pedido)
+    let htmlFinal = String(body.manualCode || '<!DOCTYPE html><html><body><h1>Hola</h1></body></html>');
+    if (body.includeSecurityShield) {
+      htmlFinal = inyectarEscudoSeguridadServidor(htmlFinal);
+    }
+
+    // 3. Subir index.html en raíz (para GitHub Pages) y en www/index.html (para Capacitor APK)
+    const htmlB64 = dataUrlToBase64(htmlFinal, false);
+    await subirArchivoGitHub({
+      ghToken: auth.ghToken,
+      owner,
+      repo: repoName,
+      filePath: 'index.html',
+      contentBase64: htmlB64,
+      message: `${changelog} - index.html`,
+      branch: defaultBranch
+    });
+
+    if (type === 'apk' || type === 'pwa') {
+      await subirArchivoGitHub({
+        ghToken: auth.ghToken,
+        owner,
+        repo: repoName,
+        filePath: 'www/index.html',
+        contentBase64: htmlB64,
+        message: `${changelog} - www/index.html`,
+        branch: defaultBranch
+      });
+    }
+
+    // 4. Subir assets multimedia / manifest / íconos
+    const assets = body.assets || {};
+    for (const [assetPath, dataUrl] of Object.entries(assets)) {
+      const b64 = dataUrlToBase64(dataUrl, true);
+      if (!b64) continue;
+      await subirArchivoGitHub({
+        ghToken: auth.ghToken,
+        owner,
+        repo: repoName,
+        filePath: assetPath,
+        contentBase64: b64,
+        message: `Asset ${assetPath}`,
+        branch: defaultBranch
+      });
+      if (type === 'apk' || type === 'pwa') {
+        await subirArchivoGitHub({
+          ghToken: auth.ghToken,
+          owner,
+          repo: repoName,
+          filePath: `www/${assetPath.replace(/^\/+/, '')}`,
+          contentBase64: b64,
+          message: `Asset www/${assetPath}`,
+          branch: defaultBranch
+        });
+      }
+    }
+
+    // 5. Subir logo si viene
+    if (body.logo) {
+      const logoB64 = dataUrlToBase64(body.logo, true);
+      if (logoB64) {
+        await subirArchivoGitHub({
+          ghToken: auth.ghToken,
+          owner,
+          repo: repoName,
+          filePath: 'icon.png',
+          contentBase64: logoB64,
+          message: 'Logo app',
+          branch: defaultBranch
+        });
+      }
+    }
+
+    // 6. Si es APK o PWA, subir workflow de GitHub Actions
+    if (type === 'apk' || type === 'pwa') {
+      const workflowYaml = generarWorkflowApk({
+        appName,
+        packageId,
+        versionName,
+        versionCode,
+        signing
+      });
+      await subirArchivoGitHub({
+        ghToken: auth.ghToken,
+        owner,
+        repo: repoName,
+        filePath: '.github/workflows/build.yml',
+        contentBase64: dataUrlToBase64(workflowYaml, false),
+        message: `Workflow APK ${versionName} (vc ${versionCode})`,
+        branch: defaultBranch
+      });
+    }
+
+    // 7. Activar GitHub Pages en la rama `main` (o rama por defecto) para Web y PWA
+    let siteUrl = '';
+    let pagesWarning = null;
+    if (type === 'web' || type === 'pwa') {
+      const pagesRes = await asegurarGitHubPagesMain({
+        owner,
+        repo: repoName,
+        ghToken: auth.ghToken,
+        branch: defaultBranch,
+        sitePath: '/'
+      });
+      if (pagesRes.ok) {
+        siteUrl = pagesRes.url;
+      } else {
+        pagesWarning = pagesRes.error;
+        siteUrl = `https://${owner}.github.io/${repoName}/`;
+        console.warn('Aviso GitHub Pages:', pagesRes.status, pagesRes.error);
+      }
+    }
+
+    res.json({
+      ok: true,
+      repo: `${owner}/${repoName}`,
+      repoUrl: repoInfo.html_url || `https://github.com/${owner}/${repoName}`,
+      siteUrl,
+      pagesWarning
+    });
+  } catch (e) {
+    console.error('Error en /api/build:', e);
+    res.status(500).json({ error: e.message || 'Error interno al construir.' });
+  }
+});
+
+// ---- Consultar estado del workflow en GitHub Actions ----
+app.get('/api/runs', async (req, res) => {
+  const auth = resolverAuth(req);
+  if (!auth) return res.status(401).json({ error: 'No autorizado.' });
+
+  const fullRepo = String(req.query.repo || '').trim();
+  if (!fullRepo.includes('/')) return res.status(400).json({ error: 'Falta parámetro repo.' });
+
+  try {
+    const r = await ghFetch(auth.ghToken, `/repos/${fullRepo}/actions/runs?per_page=1`);
+    if (!r.ok) return res.json({ none: true });
+    const data = await r.json();
+    const run = data.workflow_runs && data.workflow_runs[0];
+    if (!run) return res.json({ none: true });
+    res.json({
+      id: run.id,
+      status: run.status,
+      conclusion: run.conclusion,
+      html_url: run.html_url
+    });
+  } catch (e) {
+    res.json({ none: true });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`FabricApp backend listening on port ${PORT}`);
+  console.log(`LaFabricApp backend escuchando en puerto ${PORT}`);
 });
+      
