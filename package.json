@@ -1,15 +1,16 @@
 {
   "name": "lafabricapp-server",
   "version": "1.1.0",
-  "private": true,
+  "description": "Backend de LaFabricApp para creación de repos, GitHub Pages y compilación de APKs firmadas",
   "main": "server.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.21.2",
+    "libsodium-wrappers": "^0.7.15"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
